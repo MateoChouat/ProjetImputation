@@ -13,7 +13,7 @@ import numpy as np
 import optuna
 from sklearn.metrics import mean_absolute_error
 from config import cat_features, num_features, target_column
-from sklearn.preprocessing import StandardScaler, PowerTransformer
+from sklearn.preprocessing import StandardScaler
 
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -88,36 +88,65 @@ def preprocess_data(gdf):
             hidden_size = trial.suggest_int("hidden_size", 32, 128)
             dropout = trial.suggest_float("dropout", 0.1, 0.5)
             lr = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
-
-            model = MCDropoutNet(input_dim=X_train.shape[1], hidden_size=hidden_size, dropout=dropout).to(device)
+        
+            model = MCDropoutNet(input_dim=X_train_tensor.shape[1],
+                                 hidden_size=hidden_size, dropout=dropout).to(device)
             optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-
-            best_loss = float('inf')
+            # Use a learning rate scheduler that reduces lr on plateau of training loss.
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+        
+            best_val_loss = float('inf')
             patience = 10
             counter = 0
-
-            for epoch in range(100):
+        
+            num_epochs = 50  # Use fewer epochs during hyperparameter search
+        
+            for epoch in range(num_epochs):
                 model.train()
                 optimizer.zero_grad()
-                y_pred = model(X_train_tensor)
+                outputs = model(X_train_tensor)
+                if isinstance(outputs, tuple):
+                    y_pred = outputs[0]
+                    logvar = outputs[1] if len(outputs) > 1 else None
+                else:
+                    y_pred = outputs
+                    logvar = None
+        
                 loss = F.l1_loss(y_pred, y_train_tensor)
                 loss.backward()
                 optimizer.step()
-
-                # Early stopping tracking
-                current_loss = loss.item()
-                if current_loss < best_loss - 1e-4:  # tolérance pour éviter les arrêts trop rapides
-                    best_loss = current_loss
-                    counter = 0
-                else:
-                    counter += 1
-                    if counter >= patience:
-                        print(f"⏹️  Early stopping at epoch {epoch+1}, best training loss: {best_loss:.4f}")
-                        break
-
-
-            mean_pred, _ = predict_mc(model, X_val_tensor)
-            val_mae = mean_absolute_error(mean_pred.cpu().detach().numpy(), y_val.to_numpy())
+        
+                # Update learning rate scheduler based on current epoch loss
+                scheduler.step(loss.item())
+        
+                # Report intermediate result to allow pruning.
+                trial.report(loss.item(), epoch)
+                if trial.should_prune():
+                    raise optuna.exceptions.TrialPruned()
+        
+                # Option: Validate periodically (every few epochs) and use that for early stopping.
+                if epoch % 5 == 0:
+                    model.eval()
+                    with torch.no_grad():
+                        mean_pred, _ = predict_mc(model, X_val_tensor)
+                        val_loss = mean_absolute_error(mean_pred.cpu().detach().numpy(),
+                                                       y_val_tensor.cpu().numpy().flatten())
+                    # Check for improvement
+                    if val_loss < best_val_loss - 1e-4:
+                        best_val_loss = val_loss
+                        counter = 0
+                    else:
+                        counter += 1
+                        if counter >= patience:
+                            print(f"⏹️  Early stopping at epoch {epoch+1}, best validation MAE: {best_val_loss:.4f}")
+                            break
+        
+            # Final evaluation on validation set
+            model.eval()
+            with torch.no_grad():
+                mean_pred, _ = predict_mc(model, X_val_tensor)
+                val_mae = mean_absolute_error(mean_pred.cpu().detach().numpy(),
+                                              y_val_tensor.cpu().numpy().flatten())
             return val_mae
 
         study_fold = optuna.create_study(direction="minimize")
@@ -143,13 +172,9 @@ def preprocess_data(gdf):
     X_missing = torch.tensor(X_missing.values, dtype=torch.float32).to(device)
 
     scaler = StandardScaler()
-    transformer = PowerTransformer()
     X_train = scaler.fit_transform(X_train)
     X_val = scaler.transform(X_val)
     X_missing = scaler.transform(X_missing)
-    X_train = transformer.fit_transform(X_train)
-    X_val = transformer.transform(X_val)
-    X_missing = transformer.transform(X_missing)
     
     
     return X_train, y_train, X_val, y_val, X_missing, df_missing, year_max, year_min
